@@ -3,6 +3,7 @@ import { Telegraf } from 'telegraf';
 import { ReminderService } from '../reminders/reminder.service';
 import { ConfigService } from '@nestjs/config';
 import moment from 'moment-timezone';
+import { FirebaseService } from 'src/firebase/firebase.service';
 
 @Injectable()
 export class TelegramService implements OnModuleInit {
@@ -10,10 +11,12 @@ export class TelegramService implements OnModuleInit {
     private bot: Telegraf;
     private readonly GEMINI_URL =
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+    private readonly userTz = 'Asia/Almaty';
 
     constructor(
         private readonly reminders: ReminderService,
         private readonly config: ConfigService,
+        private readonly firebase: FirebaseService
     ) { }
 
     async onModuleInit() {
@@ -26,7 +29,6 @@ export class TelegramService implements OnModuleInit {
         this.bot = new Telegraf(token);
         this.reminders.setBot(this.bot);
 
-        // 🧠 Отслеживаем ответы после напоминаний
         const userReplies = new Map<number, { lastPrompt: string; active: boolean }>();
 
         this.bot.on('text', async (ctx) => {
@@ -37,15 +39,12 @@ export class TelegramService implements OnModuleInit {
 
             this.logger.log(`💬 [${username}] написал: "${text}"`);
 
-            // Если бот ранее ждал ответ от пользователя — считаем задачу закрытой
             const waiting = userReplies.get(user.id);
             if (waiting?.active) {
                 userReplies.set(user.id, { ...waiting, active: false });
                 await ctx.reply('✅ Отлично! Будем считать задачу выполненной.');
                 return;
             }
-
-            const userTz = 'Asia/Almaty';
 
             const prompt = `
 Ты — Telegram-ассистент, который создает напоминания пользователям из разных стран.
@@ -56,34 +55,27 @@ export class TelegramService implements OnModuleInit {
   "message": "короткий понятный ответ пользователю, где ты явно указываешь локальное время напоминания",
   "reminder"?: {
     "text": "что напомнить",
-    "datetime": "ISO-время (UTC или с таймзоной)"
-  }
-}
-
-📘 Пример:
-Пользователь: "напомни через 10 минут выпить воду"
-Ответ:
-{
-  "action": "reminder",
-  "message": "Окей! Я напомню тебе выпить воду в 03:25 по твоему времени.",
-  "reminder": {
-    "text": "выпить воду",
-    "datetime": "2025-10-30T03:25:00+05:00"
+    "datetime": "ISO-время в UTC, которое соответствует локальному времени пользователя"
   }
 }
 
 Текущее время (UTC): ${now}.
 Пользователь написал: "${text}".
-Определи дату и время напоминания точно и корректно.
+
+⚠️ Важное:
+- Локальная часовая зона пользователя: Asia/Almaty (UTC+5).  
+- В поле "datetime" верни **ISO-время в UTC**, которое соответствует локальному времени пользователя.  
+  Например, если пользователь написал "в 8 утра", верни UTC-время, которое соответствует 08:00 по Asia/Almaty.
+- Не меняй текст сообщения, просто дай корректное UTC-время.
+- Никогда не смещай UTC ещё раз на локальную зону — это должно быть чистое UTC-время для сохранения.
+
+Ответ строго в JSON.
 `;
 
             try {
                 const response = await fetch(this.GEMINI_URL, {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-goog-api-key': apiKey,
-                    },
+                    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
                     body: JSON.stringify({
                         contents: [{ role: 'user', parts: [{ text: prompt }] }],
                         generationConfig: { temperature: 0.5, topP: 0.9, maxOutputTokens: 300 },
@@ -91,7 +83,6 @@ export class TelegramService implements OnModuleInit {
                 });
 
                 const data = await response.json();
-
                 if (data.error) {
                     this.logger.error(`❌ Gemini API error: ${data.error.message}`);
                     await ctx.reply('⚠️ Ошибка при обращении к AI. Попробуй позже.');
@@ -112,7 +103,12 @@ export class TelegramService implements OnModuleInit {
 
                 let parsed: any;
                 try {
-                    parsed = JSON.parse(rawReply);
+                    const jsonStart = rawReply.indexOf('{');
+                    if (jsonStart === -1) {
+                        await ctx.reply('⚠️ AI ответил в неправильном формате, попробуй иначе.');
+                        return;
+                    }
+                    parsed = JSON.parse(rawReply.slice(jsonStart));
                 } catch {
                     this.logger.warn(`⚠️ Gemini вернул невалидный JSON: ${rawReply}`);
                     await ctx.reply('⚠️ AI ответил в неправильном формате, попробуй иначе.');
@@ -122,60 +118,23 @@ export class TelegramService implements OnModuleInit {
                 this.logger.log(`🤖 Ответ Gemini: ${JSON.stringify(parsed)}`);
 
                 if (parsed.action === 'reminder' && parsed.reminder?.datetime) {
-                    const reminderDate = new Date(parsed.reminder.datetime);
-
-                    if (isNaN(reminderDate.getTime())) {
-                        this.logger.warn(`⚠️ Некорректная дата: ${parsed.reminder.datetime}`);
-                        await ctx.reply('⚠️ Не понял, когда именно напомнить. Укажи точнее.');
-                        return;
-                    }
+                    // 1. Сохраняем UTC напрямую
+                    const utcDate = moment.utc(parsed.reminder.datetime).toDate();
 
                     await this.reminders.create({
                         userId: user.id,
                         text: parsed.reminder.text,
-                        datetime: reminderDate,
+                        datetime: utcDate, // сохраняем UTC
                     });
 
-                    const localTime = moment(reminderDate)
-                        .tz(userTz)
+                    // 2. Конвертируем только для ответа пользователю
+                    const localTime = moment(utcDate)
+                        .tz(this.userTz)
                         .format('HH:mm, D MMMM');
 
-                    this.logger.log(
-                        `✅ Напоминание "${parsed.reminder.text}" на ${reminderDate.toISOString()}`,
-                    );
-
                     await ctx.reply(
-                        `✅ Окей! Я напомню тебе "${parsed.reminder.text}" в ${localTime} по твоему времени.`,
+                        `✅ Окей! Я напомню тебе "${parsed.reminder.text}" в ${localTime} по твоему времени.`
                     );
-
-                    // ⚙️ Когда наступит время напоминания
-                    const delay = reminderDate.getTime() - Date.now();
-                    if (delay > 0) {
-                        setTimeout(async () => {
-                            await ctx.reply(`⏰ Напоминаю: ${parsed.reminder.text}. Ну что, как там дела?`);
-                            userReplies.set(user.id, { lastPrompt: parsed.reminder.text, active: true });
-
-                            const followUps = [
-                                { delay: 7 * 60 * 1000, text: 'Слушай, а как там, всё сделал?' },
-                                { delay: 25 * 60 * 1000, text: 'Кажется, тишина... надеюсь, всё в порядке?' },
-                                {
-                                    delay: 60 * 60 * 1000,
-                                    text: 'Ладно, будем считать задачу выполненной ☑️ (ответа не получил)',
-                                },
-                            ];
-
-                            for (const follow of followUps) {
-                                setTimeout(async () => {
-                                    const state = userReplies.get(user.id);
-                                    if (!state?.active) return; // если ответил — не напоминаем
-                                    await ctx.reply(follow.text);
-                                    if (follow.text.includes('☑️')) {
-                                        userReplies.set(user.id, { ...state, active: false });
-                                    }
-                                }, follow.delay);
-                            }
-                        }, delay);
-                    }
                     return;
                 }
 

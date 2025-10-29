@@ -1,26 +1,35 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import * as cron from 'node-cron';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { Reminder } from './reminder.entity';
 import { Telegraf } from 'telegraf';
+import { FirebaseService } from 'src/firebase/firebase.service';
+import moment from 'moment-timezone';
+
+interface Reminder {
+    id: string;
+    userId: number;
+    text: string;
+    datetime: Date;
+    isSent: boolean;
+}
 
 @Injectable()
 export class ReminderService implements OnModuleInit {
     private readonly logger = new Logger(ReminderService.name);
     private bot: Telegraf;
+    private readonly userTz = 'Asia/Almaty';
 
-    constructor(
-        @InjectRepository(Reminder)
-        private readonly reminderRepo: Repository<Reminder>,
-    ) { }
+    constructor(private readonly firebase: FirebaseService) { }
 
     setBot(bot: Telegraf) {
         this.bot = bot;
     }
 
     async onModuleInit() {
-        const reminders = await this.reminderRepo.find({ where: { isSent: false } });
+        const rawReminders = await this.firebase.getPendingReminders();
+        const reminders: Reminder[] = rawReminders.map((r: any) => {
+            const utcDate = moment.utc(r.datetime).toDate(); // просто UTC
+            return { ...r, datetime: utcDate };
+        });
+
         this.logger.log(`📦 Восстанавливаем ${reminders.length} активных напоминаний...`);
 
         for (const reminder of reminders) {
@@ -29,41 +38,34 @@ export class ReminderService implements OnModuleInit {
     }
 
     async create(data: { userId: number; text: string; datetime: Date }) {
-        const reminder = this.reminderRepo.create(data);
-        await this.reminderRepo.save(reminder);
+        const savedRaw = await this.firebase.saveReminder(data.userId, data.text, data.datetime);
+
+        const saved: Reminder = {
+            ...savedRaw,
+            datetime: moment.utc(savedRaw.datetime).tz(this.userTz).toDate(),
+        };
 
         this.logger.log(
-            `💾 Напоминание сохранено: userId=${data.userId}, text="${data.text}", datetime=${data.datetime.toISOString()}`
+            `💾 Напоминание сохранено: userId=${data.userId}, text="${data.text}", datetime=${saved.datetime.toISOString()}`
         );
 
-        this.scheduleReminder(reminder);
-        return reminder;
+        this.scheduleReminder(saved);
+        return saved;
     }
 
     private scheduleReminder(reminder: Reminder) {
-        const { datetime, userId, text } = reminder;
-        const date = new Date(datetime);
-        const cronExp = this.getCronExpression(date);
+        const { userId, text, datetime, id } = reminder;
+        const delay = datetime.getTime() - Date.now();
+        if (delay <= 0) return;
 
-        this.logger.log(`🕒 Планируем напоминание для ${userId}: "${text}" в ${date.toLocaleString()} (cron: ${cronExp})`);
-
-        cron.schedule(cronExp, async () => {
+        setTimeout(async () => {
             try {
                 await this.bot.telegram.sendMessage(userId, `⏰ Напоминание: ${text}`);
-                reminder.isSent = true;
-                await this.reminderRepo.save(reminder);
+                await this.firebase.markReminderSent(id);
                 this.logger.log(`✅ Отправлено напоминание пользователю ${userId}: "${text}"`);
             } catch (e) {
                 this.logger.error(`❌ Ошибка при отправке напоминания пользователю ${userId}:`, e);
             }
-        });
-    }
-
-    private getCronExpression(date: Date): string {
-        const minute = date.getMinutes();
-        const hour = date.getHours();
-        const day = date.getDate();
-        const month = date.getMonth() + 1;
-        return `${minute} ${hour} ${day} ${month} *`;
+        }, delay);
     }
 }
